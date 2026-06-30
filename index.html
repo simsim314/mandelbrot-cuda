@@ -14,7 +14,7 @@
     button:hover { background: #3a3a3a; }
     #status { flex: 1; color: #aaa; min-width: 260px; }
     #canvasBox { position: relative; flex: 1; min-height: 0; overflow: hidden; }
-    canvas { display: block; width: 100%; height: 100%; image-rendering: pixelated; background: black; }
+    canvas { display: block; width: 100%; height: 100%; image-rendering: pixelated; background: black; touch-action: none; user-select: none; -webkit-user-select: none; }
     #rect { position: absolute; border: 2px solid white; pointer-events: none; display: none; box-sizing: border-box; }
   </style>
 </head>
@@ -582,6 +582,7 @@ function canvasPixelFromEvent(e) {
     sy: e.clientY - r.top,
   };
 }
+
 function setRectDisplay(a, b) {
   const r = canvas.getBoundingClientRect(), br = canvasBox.getBoundingClientRect();
   const x1 = Math.min(a.sx, b.sx), y1 = Math.min(a.sy, b.sy), x2 = Math.max(a.sx, b.sx), y2 = Math.max(a.sy, b.sy);
@@ -592,36 +593,84 @@ function setRectDisplay(a, b) {
   rectDiv.style.height = `${y2 - y1}px`;
 }
 
-canvas.addEventListener("mousedown", e => {
-  if (e.button !== 0) return;
-  drag = { start: canvasPixelFromEvent(e), end: canvasPixelFromEvent(e) };
-  setRectDisplay(drag.start, drag.end);
-});
-window.addEventListener("mousemove", e => {
+async function zoomToDragRect() {
   if (!drag) return;
-  drag.end = canvasPixelFromEvent(e);
-  setRectDisplay(drag.start, drag.end);
-});
-window.addEventListener("mouseup", async e => {
-  if (!drag) return;
-  drag.end = canvasPixelFromEvent(e);
-  rectDiv.style.display = "none";
-  const x1 = Math.min(drag.start.x, drag.end.x), x2 = Math.max(drag.start.x, drag.end.x);
-  const y1 = Math.min(drag.start.y, drag.end.y), y2 = Math.max(drag.start.y, drag.end.y);
+
+  const d = drag;
   drag = null;
+  activePointerId = null;
+  rectDiv.style.display = "none";
+
+  const x1 = Math.min(d.start.x, d.end.x), x2 = Math.max(d.start.x, d.end.x);
+  const y1 = Math.min(d.start.y, d.end.y), y2 = Math.max(d.start.y, d.end.y);
+
   if (x2 - x1 < 8 || y2 - y1 < 8) return;
+
   history.push({ ...view });
+
   const dx = decimalSub(view.xMax, view.xMin), dy = decimalSub(view.yMax, view.yMin);
   const fx1 = decimalDivInt(String(x1), W), fx2 = decimalDivInt(String(x2), W);
   const fy1 = decimalDivInt(String(y1), H), fy2 = decimalDivInt(String(y2), H);
   const oldXMin = view.xMin, oldYMin = view.yMin;
+
   view.xMin = decimalAdd(oldXMin, decimalMul(dx, fx1));
   view.xMax = decimalAdd(oldXMin, decimalMul(dx, fx2));
   view.yMin = decimalAdd(oldYMin, decimalMul(dy, fy1));
   view.yMax = decimalAdd(oldYMin, decimalMul(dy, fy2));
+
   applyAutoOrClampManual();
   await render();
-});
+}
+
+let activePointerId = null;
+
+canvas.addEventListener("pointerdown", e => {
+  if (e.pointerType === "mouse" && e.button !== 0) return;
+
+  e.preventDefault();
+  activePointerId = e.pointerId;
+
+  try {
+    canvas.setPointerCapture(e.pointerId);
+  } catch (_) {}
+
+  const p = canvasPixelFromEvent(e);
+  drag = { start: p, end: p };
+  setRectDisplay(drag.start, drag.end);
+}, { passive: false });
+
+window.addEventListener("pointermove", e => {
+  if (!drag || e.pointerId !== activePointerId) return;
+
+  e.preventDefault();
+  drag.end = canvasPixelFromEvent(e);
+  setRectDisplay(drag.start, drag.end);
+}, { passive: false });
+
+window.addEventListener("pointerup", async e => {
+  if (!drag || e.pointerId !== activePointerId) return;
+
+  e.preventDefault();
+
+  try {
+    canvas.releasePointerCapture(e.pointerId);
+  } catch (_) {}
+
+  drag.end = canvasPixelFromEvent(e);
+  await zoomToDragRect();
+}, { passive: false });
+
+window.addEventListener("pointercancel", e => {
+  if (!drag || e.pointerId !== activePointerId) return;
+
+  drag = null;
+  activePointerId = null;
+  rectDiv.style.display = "none";
+
+  try {
+    canvas.releasePointerCapture(e.pointerId);
+  } catch (_) {}
+}, { passive: false });
 
 renderBtn.addEventListener("click", () => {
   applyAutoOrClampManual();
