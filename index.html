@@ -1,0 +1,669 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>WebGPU Arbitrary-Precision Mandelbrot</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html, body { margin: 0; background: #111; color: #ddd; font-family: system-ui, sans-serif; overflow: hidden; }
+    #wrap { display: flex; flex-direction: column; height: 100vh; }
+    #top { padding: 8px 10px; background: #1b1b1b; border-bottom: 1px solid #333; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; font-size: 13px; }
+    label { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+    input[type="number"] { width: 92px; background: #101010; color: #eee; border: 1px solid #555; padding: 3px; }
+    button { background: #2b2b2b; color: #eee; border: 1px solid #555; padding: 4px 9px; cursor: pointer; }
+    button:hover { background: #3a3a3a; }
+    #status { flex: 1; color: #aaa; min-width: 260px; }
+    #canvasBox { position: relative; flex: 1; min-height: 0; overflow: hidden; }
+    canvas { display: block; width: 100%; height: 100%; image-rendering: pixelated; background: black; }
+    #rect { position: absolute; border: 2px solid white; pointer-events: none; display: none; box-sizing: border-box; }
+  </style>
+</head>
+<body>
+<div id="wrap">
+  <div id="top">
+    <button id="renderBtn">render</button>
+    <button id="undoBtn">undo</button>
+
+    <label><input id="autoParams" type="checkbox" checked> auto limbs/max_iter</label>
+
+    <label>max_iter <input id="maxIter" type="number" min="16" step="1" value="300"></label>
+    <label>limbs <input id="limbs" type="number" min="4" max="32" step="1" value="6"></label>
+    <label>color_N <input id="colorN" type="number" min="1" max="4096" step="1" value="4"></label>
+    <label>chunk rows <input id="chunkRows" type="number" min="1" max="256" step="1" value="16"></label>
+    <label>width <input id="renderW" type="number" min="128" max="4096" step="1" value="900"></label>
+    <label>height <input id="renderH" type="number" min="128" max="4096" step="1" value="650"></label>
+    <span id="status">loading...</span>
+  </div>
+  <div id="canvasBox">
+    <canvas id="canvas"></canvas>
+    <div id="rect"></div>
+  </div>
+</div>
+
+<script type="module">
+"use strict";
+
+/*
+  No-backend WebGPU arbitrary-precision Mandelbrot.
+  The shader uses u32 limbs, not float32, for Mandelbrot math.
+  JavaScript uses BigInt for Decimal -> fixed-point limbs.
+  WGSL private arrays need a fixed compile-time size, so changing limb count recompiles the shader.
+*/
+
+const canvas = document.getElementById("canvas");
+const canvasBox = document.getElementById("canvasBox");
+const rectDiv = document.getElementById("rect");
+const statusEl = document.getElementById("status");
+
+const autoParamsEl = document.getElementById("autoParams");
+
+const maxIterEl = document.getElementById("maxIter");
+const limbsEl = document.getElementById("limbs");
+const colorNEl = document.getElementById("colorN");
+const chunkRowsEl = document.getElementById("chunkRows");
+const renderWEl = document.getElementById("renderW");
+const renderHEl = document.getElementById("renderH");
+const renderBtn = document.getElementById("renderBtn");
+const undoBtn = document.getElementById("undoBtn");
+
+let adapter = null, device = null, queue = null, pipeline = null, shaderLimbs = 0;
+let ctx = canvas.getContext("2d", { alpha: false });
+let imageData = null;
+let W = 900, H = 650;
+let cancelToken = 0;
+let drag = null;
+let history = [];
+
+let view = { xMin: "-2.5", xMax: "1.0", yMin: "-1.125", yMax: "1.125" };
+
+function setStatus(s) { statusEl.textContent = s; }
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+function parseDecimalToRatio(s) {
+  s = String(s).trim();
+  let sign = 1n;
+  if (s.startsWith("-")) { sign = -1n; s = s.slice(1); }
+  else if (s.startsWith("+")) { s = s.slice(1); }
+  let exp = 0;
+  const e1 = s.indexOf("e"), e2 = s.indexOf("E");
+  const epos = e1 >= 0 ? e1 : e2;
+  if (epos >= 0) { exp = parseInt(s.slice(epos + 1), 10); s = s.slice(0, epos); }
+  let intPart = s, fracPart = "";
+  const dot = s.indexOf(".");
+  if (dot >= 0) { intPart = s.slice(0, dot); fracPart = s.slice(dot + 1); }
+  if (intPart === "") intPart = "0";
+  let digits = (intPart + fracPart).replace(/^0+/, "");
+  if (digits === "") digits = "0";
+  let num = BigInt(digits), den = 10n ** BigInt(fracPart.length);
+  if (exp > 0) num *= 10n ** BigInt(exp);
+  else if (exp < 0) den *= 10n ** BigInt(-exp);
+  return [sign * num, den];
+}
+
+function gcdAbs(a, b) {
+  a = a < 0n ? -a : a; b = b < 0n ? -b : b;
+  while (b !== 0n) { const t = a % b; a = b; b = t; }
+  return a;
+}
+
+function bitLengthBigInt(x) {
+  x = x < 0n ? -x : x;
+  if (x === 0n) return 0;
+  return x.toString(2).length;
+}
+
+function log2BigIntApprox(x) {
+  x = x < 0n ? -x : x;
+  if (x <= 0n) return -Infinity;
+
+  const bits = bitLengthBigInt(x);
+  const keep = 53;
+
+  if (bits > keep) {
+    const top = Number(x >> BigInt(bits - keep));
+    return (bits - keep) + Math.log2(top);
+  }
+
+  return Math.log2(Number(x));
+}
+
+function log2RatioAbs(num, den) {
+  if (num < 0n) num = -num;
+  if (den < 0n) den = -den;
+  if (num === 0n) return -Infinity;
+  return log2BigIntApprox(num) - log2BigIntApprox(den);
+}
+
+function decimalDiffRatio(a, b) {
+  let [an, ad] = parseDecimalToRatio(a);
+  let [bn, bd] = parseDecimalToRatio(b);
+
+  let n = an * bd - bn * ad;
+  let d = ad * bd;
+
+  const g = gcdAbs(n, d);
+  return [n / g, d / g];
+}
+
+function currentPixelLog2Step() {
+  let [dxn, dxd] = decimalDiffRatio(view.xMax, view.xMin);
+  let [dyn, dyd] = decimalDiffRatio(view.yMax, view.yMin);
+
+  if (dxn < 0n) dxn = -dxn;
+  if (dyn < 0n) dyn = -dyn;
+
+  const log2StepX = log2RatioAbs(dxn, dxd * BigInt(W));
+  const log2StepY = log2RatioAbs(dyn, dyd * BigInt(H));
+
+  return Math.min(log2StepX, log2StepY);
+}
+
+function setNumberBox(el, value) {
+  const text = String(value);
+  el.value = text;
+  el.setAttribute("value", text);
+}
+
+const AUTO_ITER_SCALE = 16.0;
+const AUTO_GUARD_LIMBS = 5;
+
+function minRequiredLimbs() {
+  const log2Step = currentPixelLog2Step();
+  const zoomBits = Math.max(0, -log2Step);
+  const minLimbs = Math.max(4, Math.ceil(zoomBits / 32.0) + AUTO_GUARD_LIMBS);
+  return { zoomBits, minLimbs };
+}
+
+function autoChooseParams() {
+  const { zoomBits, minLimbs } = minRequiredLimbs();
+
+  // No exposed min_iter / iter_scale controls.
+  // One constant: max_iter = 16 * zoom_bits^2, clamped to at least 16.
+  const autoIter = Math.max(16, Math.ceil(AUTO_ITER_SCALE * zoomBits * zoomBits));
+
+  setNumberBox(limbsEl, minLimbs);
+  setNumberBox(maxIterEl, autoIter);
+  limbsEl.min = String(minLimbs);
+
+  return { zoomBits, limbsUsed: minLimbs, maxIterUsed: autoIter, minLimbs, auto: true };
+}
+
+function applyAutoOrClampManual() {
+  const { zoomBits, minLimbs } = minRequiredLimbs();
+  limbsEl.min = String(minLimbs);
+
+  if (autoParamsEl && autoParamsEl.checked) {
+    return autoChooseParams();
+  }
+
+  let manualLimbs = parseInt(limbsEl.value || String(minLimbs), 10);
+  if (!Number.isFinite(manualLimbs)) manualLimbs = minLimbs;
+  manualLimbs = Math.max(minLimbs, manualLimbs);
+  setNumberBox(limbsEl, manualLimbs);
+
+  let manualIter = parseInt(maxIterEl.value || "16", 10);
+  if (!Number.isFinite(manualIter)) manualIter = 16;
+  manualIter = Math.max(1, manualIter);
+  setNumberBox(maxIterEl, manualIter);
+
+  return { zoomBits, limbsUsed: manualLimbs, maxIterUsed: manualIter, minLimbs, auto: false };
+}
+
+function ratioToDecimal(num, den, digits = 320) {
+  if (den < 0n) { num = -num; den = -den; }
+  const neg = num < 0n; if (neg) num = -num;
+  const ip = num / den;
+  let rem = num % den;
+  let out = (neg ? "-" : "") + ip.toString();
+  if (digits <= 0 || rem === 0n) return out;
+  out += ".";
+  for (let i = 0; i < digits && rem !== 0n; i++) {
+    rem *= 10n;
+    out += (rem / den).toString();
+    rem %= den;
+  }
+  return out;
+}
+
+function decimalAdd(a, b) {
+  let [an, ad] = parseDecimalToRatio(a), [bn, bd] = parseDecimalToRatio(b);
+  let n = an * bd + bn * ad, d = ad * bd;
+  const g = gcdAbs(n, d);
+  return ratioToDecimal(n / g, d / g);
+}
+function decimalSub(a, b) { let [bn, bd] = parseDecimalToRatio(b); return decimalAdd(a, ratioToDecimal(-bn, bd)); }
+function decimalMul(a, b) {
+  let [an, ad] = parseDecimalToRatio(a), [bn, bd] = parseDecimalToRatio(b);
+  let n = an * bn, d = ad * bd;
+  const g = gcdAbs(n, d);
+  return ratioToDecimal(n / g, d / g);
+}
+function decimalDivInt(a, k) {
+  let [an, ad] = parseDecimalToRatio(a);
+  const d = ad * BigInt(k), g = gcdAbs(an, d);
+  return ratioToDecimal(an / g, d / g);
+}
+
+function decimalToFixedLimbs(s, nLimbs) {
+  const [num, den] = parseDecimalToRatio(s);
+  const fracBits = 32n * BigInt(nLimbs - 1);
+  const scale = 1n << fracBits;
+  let scaled = (num * scale) / den;
+  const totalBits = 32n * BigInt(nLimbs);
+  const mod = 1n << totalBits;
+  if (scaled < 0n) scaled = mod + scaled;
+  const out = new Uint32Array(nLimbs);
+  for (let i = nLimbs - 1; i >= 0; i--) { out[i] = Number(scaled & 0xffffffffn); scaled >>= 32n; }
+  return out;
+}
+
+function makeUniforms(width, height, y0, h, maxIter, nLimbs) {
+  return new Uint32Array([width >>> 0, height >>> 0, y0 >>> 0, h >>> 0, maxIter >>> 0, nLimbs >>> 0, 0, 0]);
+}
+
+function makeInputLimbs(nLimbs, y0) {
+  const data = new Uint32Array(nLimbs * 4);
+  const dx = decimalSub(view.xMax, view.xMin);
+  const dy = decimalSub(view.yMax, view.yMin);
+  const stepX = decimalDivInt(dx, W);
+  const stepY = decimalDivInt(dy, H);
+  const yStart = decimalAdd(view.yMin, decimalMul(stepY, String(y0)));
+  data.set(decimalToFixedLimbs(view.xMin, nLimbs), 0 * nLimbs);
+  data.set(decimalToFixedLimbs(yStart, nLimbs), 1 * nLimbs);
+  data.set(decimalToFixedLimbs(stepX, nLimbs), 2 * nLimbs);
+  data.set(decimalToFixedLimbs(stepY, nLimbs), 3 * nLimbs);
+  return data;
+}
+
+function makeWGSL(maxLimbs) {
+  return `
+const MAX_LIMBS: u32 = ${maxLimbs}u;
+
+struct Uniforms { width: u32, height: u32, y0: u32, chunk_h: u32, max_iter: u32, n_limbs: u32, pad0: u32, pad1: u32 };
+@group(0) @binding(0) var<uniform> uni: Uniforms;
+@group(0) @binding(1) var<storage, read> params: array<u32>;
+@group(0) @binding(2) var<storage, read_write> out_iter: array<u32>;
+
+fn zero_arr() -> array<u32, ${maxLimbs}> {
+  var r: array<u32, ${maxLimbs}>;
+  for (var i: u32 = 0u; i < MAX_LIMBS; i = i + 1u) { r[i] = 0u; }
+  return r;
+}
+
+fn load_param(which: u32) -> array<u32, ${maxLimbs}> {
+  var r: array<u32, ${maxLimbs}>;
+  let base = which * uni.n_limbs;
+  for (var i: u32 = 0u; i < MAX_LIMBS; i = i + 1u) { r[i] = select(0u, params[base + i], i < uni.n_limbs); }
+  return r;
+}
+
+fn add_b(a: array<u32, ${maxLimbs}>, b: array<u32, ${maxLimbs}>) -> array<u32, ${maxLimbs}> {
+  var r: array<u32, ${maxLimbs}>;
+  var carry: u32 = 0u;
+  var kk: u32 = 0u;
+  loop {
+    if (kk >= uni.n_limbs) { break; }
+    let i = uni.n_limbs - 1u - kk;
+    let s1 = a[i] + b[i];
+    let c1 = select(0u, 1u, s1 < a[i]);
+    let s2 = s1 + carry;
+    let c2 = select(0u, 1u, s2 < s1);
+    r[i] = s2;
+    carry = c1 + c2;
+    kk = kk + 1u;
+  }
+  for (var i: u32 = 0u; i < MAX_LIMBS; i = i + 1u) { if (i >= uni.n_limbs) { r[i] = 0u; } }
+  return r;
+}
+
+fn neg_b(a: array<u32, ${maxLimbs}>) -> array<u32, ${maxLimbs}> {
+  var r: array<u32, ${maxLimbs}>;
+  var carry: u32 = 1u;
+  var kk: u32 = 0u;
+  loop {
+    if (kk >= uni.n_limbs) { break; }
+    let i = uni.n_limbs - 1u - kk;
+    let inv = ~a[i];
+    let s = inv + carry;
+    r[i] = s;
+    carry = select(0u, 1u, s < inv);
+    kk = kk + 1u;
+  }
+  for (var i: u32 = 0u; i < MAX_LIMBS; i = i + 1u) { if (i >= uni.n_limbs) { r[i] = 0u; } }
+  return r;
+}
+
+fn sub_b(a: array<u32, ${maxLimbs}>, b: array<u32, ${maxLimbs}>) -> array<u32, ${maxLimbs}> { return add_b(a, neg_b(b)); }
+fn is_neg(a: array<u32, ${maxLimbs}>) -> bool { return (a[0] & 0x80000000u) != 0u; }
+fn abs_b(a: array<u32, ${maxLimbs}>) -> array<u32, ${maxLimbs}> { if (is_neg(a)) { return neg_b(a); } return a; }
+
+fn mul32_hi_lo(a: u32, b: u32) -> vec2<u32> {
+  let a0 = a & 0xffffu; let a1 = a >> 16u;
+  let b0 = b & 0xffffu; let b1 = b >> 16u;
+  let p0 = a0 * b0;
+  let p1 = a0 * b1;
+  let p2 = a1 * b0;
+  let p3 = a1 * b1;
+  let middle = (p0 >> 16u) + (p1 & 0xffffu) + (p2 & 0xffffu);
+  let lo = (p0 & 0xffffu) | (middle << 16u);
+  let hi = p3 + (p1 >> 16u) + (p2 >> 16u) + (middle >> 16u);
+  return vec2<u32>(hi, lo);
+}
+
+fn add_to_temp(temp_in: array<u32, ${maxLimbs * 2}>, pos: u32, value: u32) -> array<u32, ${maxLimbs * 2}> {
+  var temp = temp_in;
+  var p = pos;
+  var v = value;
+  loop {
+    if (v == 0u || p >= MAX_LIMBS * 2u) { break; }
+    let old = temp[p];
+    let nv = old + v;
+    temp[p] = nv;
+    v = select(0u, 1u, nv < old);
+    if (p == 0u) { break; }
+    p = p - 1u;
+  }
+  return temp;
+}
+
+fn mul_abs(a: array<u32, ${maxLimbs}>, b: array<u32, ${maxLimbs}>) -> array<u32, ${maxLimbs}> {
+  var temp: array<u32, ${maxLimbs * 2}>;
+  for (var i: u32 = 0u; i < MAX_LIMBS * 2u; i = i + 1u) { temp[i] = 0u; }
+  var ii: u32 = 0u;
+  loop {
+    if (ii >= uni.n_limbs) { break; }
+    let i = uni.n_limbs - 1u - ii;
+    var jj: u32 = 0u;
+    loop {
+      if (jj >= uni.n_limbs) { break; }
+      let j = uni.n_limbs - 1u - jj;
+      let pos = i + j + 1u;
+      let prod = mul32_hi_lo(a[i], b[j]);
+      temp = add_to_temp(temp, pos, prod.y);
+      if (pos > 0u) { temp = add_to_temp(temp, pos - 1u, prod.x); }
+      jj = jj + 1u;
+    }
+    ii = ii + 1u;
+  }
+  var r: array<u32, ${maxLimbs}>;
+  for (var i: u32 = 0u; i < MAX_LIMBS; i = i + 1u) { r[i] = select(0u, temp[i + 1u], i < uni.n_limbs); }
+  return r;
+}
+
+fn mul_b(a0: array<u32, ${maxLimbs}>, b0: array<u32, ${maxLimbs}>) -> array<u32, ${maxLimbs}> {
+  let na = is_neg(a0); let nb = is_neg(b0);
+  var r = mul_abs(abs_b(a0), abs_b(b0));
+  if (na != nb) { r = neg_b(r); }
+  return r;
+}
+
+fn mul_uint_b(a: array<u32, ${maxLimbs}>, b: u32) -> array<u32, ${maxLimbs}> {
+  let na = is_neg(a);
+  let aa = abs_b(a);
+  var r: array<u32, ${maxLimbs}>;
+  var carry: u32 = 0u;
+  var kk: u32 = 0u;
+  loop {
+    if (kk >= uni.n_limbs) { break; }
+    let i = uni.n_limbs - 1u - kk;
+    let prod = mul32_hi_lo(aa[i], b);
+    let s = prod.y + carry;
+    let c = select(0u, 1u, s < prod.y);
+    r[i] = s;
+    carry = prod.x + c;
+    kk = kk + 1u;
+  }
+  for (var i: u32 = 0u; i < MAX_LIMBS; i = i + 1u) { if (i >= uni.n_limbs) { r[i] = 0u; } }
+  if (na) { r = neg_b(r); }
+  return r;
+}
+
+fn escaped(zx2: array<u32, ${maxLimbs}>, zy2: array<u32, ${maxLimbs}>) -> bool {
+  let s = add_b(zx2, zy2);
+  return s[0] >= 4u && s[0] < 0x80000000u;
+}
+
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let x = gid.x;
+  let yy = gid.y;
+  if (x >= uni.width || yy >= uni.chunk_h) { return; }
+  let x_start = load_param(0u);
+  let y_start = load_param(1u);
+  let step_x = load_param(2u);
+  let step_y = load_param(3u);
+  let cx = add_b(x_start, mul_uint_b(step_x, x));
+  let cy = add_b(y_start, mul_uint_b(step_y, yy));
+  var zx = zero_arr(); var zy = zero_arr(); var zx2 = zero_arr(); var zy2 = zero_arr();
+  var iter: u32 = 0u;
+  loop {
+    if (iter >= uni.max_iter) { break; }
+    if (escaped(zx2, zy2)) { break; }
+    let zxzy = mul_b(zx, zy);
+    zy = add_b(add_b(zxzy, zxzy), cy);
+    zx = add_b(sub_b(zx2, zy2), cx);
+    zx2 = mul_b(zx, zx);
+    zy2 = mul_b(zy, zy);
+    iter = iter + 1u;
+  }
+  out_iter[yy * uni.width + x] = iter;
+}
+`;
+}
+
+async function initWebGPU() {
+  if (!navigator.gpu) throw new Error("WebGPU not available. Use Chrome/Edge or Firefox Nightly with WebGPU enabled.");
+  adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+  if (!adapter) throw new Error("No WebGPU adapter found.");
+  device = await adapter.requestDevice();
+  queue = device.queue;
+  device.lost.then(info => setStatus("WebGPU device lost: " + info.message));
+}
+
+async function ensurePipeline(nLimbs) {
+  if (pipeline && shaderLimbs === nLimbs) return;
+  shaderLimbs = nLimbs;
+  const module = device.createShaderModule({ code: makeWGSL(nLimbs) });
+  const info = await module.getCompilationInfo();
+  const err = info.messages.find(m => m.type === "error");
+  if (err) throw new Error(`WGSL error line ${err.lineNum}: ${err.message}`);
+  pipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "main" } });
+}
+
+function makePalette() {
+  const stops = [[0.00,0,7,100],[0.16,32,107,203],[0.42,237,255,255],[0.64,255,170,0],[0.82,180,0,0],[1.00,255,255,255]];
+  const pal = new Uint8Array(256 * 3);
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255;
+    let k = 0;
+    while (k + 1 < stops.length && t > stops[k + 1][0]) k++;
+    const a = stops[k], b = stops[Math.min(k + 1, stops.length - 1)];
+    const u = b[0] === a[0] ? 0 : (t - a[0]) / (b[0] - a[0]);
+    pal[i*3+0] = Math.round(a[1] + u * (b[1] - a[1]));
+    pal[i*3+1] = Math.round(a[2] + u * (b[2] - a[2]));
+    pal[i*3+2] = Math.round(a[3] + u * (b[3] - a[3]));
+  }
+  return pal;
+}
+const PALETTE = makePalette();
+
+function paintChunk(iterU32, y0, h, maxIter, colorN) {
+  const data = imageData.data;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < W; x++) {
+      const iter = iterU32[y * W + x];
+      const dst = ((y0 + y) * W + x) * 4;
+      if (iter >= maxIter) {
+        data[dst] = 0; data[dst+1] = 0; data[dst+2] = 0; data[dst+3] = 255;
+      } else {
+        const idx = Math.floor(iter / colorN) & 255;
+        data[dst] = PALETTE[idx*3]; data[dst+1] = PALETTE[idx*3+1]; data[dst+2] = PALETTE[idx*3+2]; data[dst+3] = 255;
+      }
+    }
+  }
+}
+
+async function render() {
+  if (!device) {
+    setStatus("WebGPU device is not ready.");
+    return;
+  }
+
+  cancelToken++;
+  const myToken = cancelToken;
+
+  W = parseInt(renderWEl.value, 10);
+  H = parseInt(renderHEl.value, 10);
+
+  const autoInfo = applyAutoOrClampManual();
+
+  const maxIter = autoInfo.maxIterUsed;
+  const nLimbs = autoInfo.limbsUsed;
+  const colorN = Math.max(1, parseInt(colorNEl.value, 10));
+  const chunkRows = Math.max(1, parseInt(chunkRowsEl.value, 10));
+  canvas.width = W; canvas.height = H;
+  imageData = ctx.createImageData(W, H);
+  for (let i = 0; i < imageData.data.length; i += 4) imageData.data[i+3] = 255;
+  ctx.putImageData(imageData, 0, 0);
+  await ensurePipeline(nLimbs);
+  const t0 = performance.now();
+  if (autoInfo.auto) {
+    setStatus(`rendering ${W}x${H}, auto, zoom_bits=${autoInfo.zoomBits.toFixed(1)}, limbs=${nLimbs}, max_iter=${maxIter}`);
+  } else {
+    setStatus(`rendering ${W}x${H}, manual, zoom_bits=${autoInfo.zoomBits.toFixed(1)}, min_limbs=${autoInfo.minLimbs}, limbs=${nLimbs}, max_iter=${maxIter}`);
+  }
+
+  for (let y0 = 0; y0 < H; y0 += chunkRows) {
+    if (myToken !== cancelToken) return;
+    const h = Math.min(chunkRows, H - y0);
+    const uniformData = makeUniforms(W, H, y0, h, maxIter, nLimbs);
+    const inputLimbs = makeInputLimbs(nLimbs, y0);
+    const uniformBuffer = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    queue.writeBuffer(uniformBuffer, 0, uniformData);
+    const paramBuffer = device.createBuffer({ size: inputLimbs.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    queue.writeBuffer(paramBuffer, 0, inputLimbs);
+    const outBytes = W * h * 4;
+    const outBuffer = device.createBuffer({ size: outBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const readBuffer = device.createBuffer({ size: outBytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const bindGroup = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: uniformBuffer } },
+        { binding: 1, resource: { buffer: paramBuffer } },
+        { binding: 2, resource: { buffer: outBuffer } },
+      ],
+    });
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(Math.ceil(W / 16), Math.ceil(h / 16), 1);
+    pass.end();
+    encoder.copyBufferToBuffer(outBuffer, 0, readBuffer, 0, outBytes);
+    queue.submit([encoder.finish()]);
+    await readBuffer.mapAsync(GPUMapMode.READ);
+    const iterU32 = new Uint32Array(readBuffer.getMappedRange().slice(0));
+    readBuffer.unmap();
+    paintChunk(iterU32, y0, h, maxIter, colorN);
+    ctx.putImageData(imageData, 0, 0);
+    setStatus(`rendering rows ${y0 + h}/${H} (${Math.round(100 * (y0 + h) / H)}%)`);
+    await new Promise(requestAnimationFrame);
+  }
+  const dt = (performance.now() - t0) / 1000;
+  setStatus(`done in ${dt.toFixed(2)}s | limbs=${nLimbs}, max_iter=${maxIter}, color=(iter//${colorN})%256`);
+}
+
+function canvasPixelFromEvent(e) {
+  const r = canvas.getBoundingClientRect();
+  return {
+    x: clamp(Math.floor((e.clientX - r.left) * canvas.width / r.width), 0, canvas.width - 1),
+    y: clamp(Math.floor((e.clientY - r.top) * canvas.height / r.height), 0, canvas.height - 1),
+    sx: e.clientX - r.left,
+    sy: e.clientY - r.top,
+  };
+}
+function setRectDisplay(a, b) {
+  const r = canvas.getBoundingClientRect(), br = canvasBox.getBoundingClientRect();
+  const x1 = Math.min(a.sx, b.sx), y1 = Math.min(a.sy, b.sy), x2 = Math.max(a.sx, b.sx), y2 = Math.max(a.sy, b.sy);
+  rectDiv.style.display = "block";
+  rectDiv.style.left = `${r.left + x1 - br.left}px`;
+  rectDiv.style.top = `${r.top + y1 - br.top}px`;
+  rectDiv.style.width = `${x2 - x1}px`;
+  rectDiv.style.height = `${y2 - y1}px`;
+}
+
+canvas.addEventListener("mousedown", e => {
+  if (e.button !== 0) return;
+  drag = { start: canvasPixelFromEvent(e), end: canvasPixelFromEvent(e) };
+  setRectDisplay(drag.start, drag.end);
+});
+window.addEventListener("mousemove", e => {
+  if (!drag) return;
+  drag.end = canvasPixelFromEvent(e);
+  setRectDisplay(drag.start, drag.end);
+});
+window.addEventListener("mouseup", async e => {
+  if (!drag) return;
+  drag.end = canvasPixelFromEvent(e);
+  rectDiv.style.display = "none";
+  const x1 = Math.min(drag.start.x, drag.end.x), x2 = Math.max(drag.start.x, drag.end.x);
+  const y1 = Math.min(drag.start.y, drag.end.y), y2 = Math.max(drag.start.y, drag.end.y);
+  drag = null;
+  if (x2 - x1 < 8 || y2 - y1 < 8) return;
+  history.push({ ...view });
+  const dx = decimalSub(view.xMax, view.xMin), dy = decimalSub(view.yMax, view.yMin);
+  const fx1 = decimalDivInt(String(x1), W), fx2 = decimalDivInt(String(x2), W);
+  const fy1 = decimalDivInt(String(y1), H), fy2 = decimalDivInt(String(y2), H);
+  const oldXMin = view.xMin, oldYMin = view.yMin;
+  view.xMin = decimalAdd(oldXMin, decimalMul(dx, fx1));
+  view.xMax = decimalAdd(oldXMin, decimalMul(dx, fx2));
+  view.yMin = decimalAdd(oldYMin, decimalMul(dy, fy1));
+  view.yMax = decimalAdd(oldYMin, decimalMul(dy, fy2));
+  applyAutoOrClampManual();
+  await render();
+});
+
+renderBtn.addEventListener("click", () => {
+  applyAutoOrClampManual();
+  render();
+});
+undoBtn.addEventListener("click", async () => {
+  if (history.length) {
+    view = history.pop();
+    applyAutoOrClampManual();
+    await render();
+  }
+});
+
+if (autoParamsEl) {
+  autoParamsEl.addEventListener("change", () => {
+    applyAutoOrClampManual();
+    render();
+  });
+}
+
+limbsEl.addEventListener("change", () => {
+  applyAutoOrClampManual();
+});
+
+maxIterEl.addEventListener("change", () => {
+  applyAutoOrClampManual();
+});
+
+async function main() {
+  try {
+    await initWebGPU();
+    setStatus("WebGPU ready");
+    applyAutoOrClampManual();
+    await render();
+  } catch (e) {
+    console.error(e);
+    setStatus(String(e.message || e));
+    renderBtn.disabled = true;
+    undoBtn.disabled = true;
+  }
+}
+main();
+</script>
+</body>
+</html>
